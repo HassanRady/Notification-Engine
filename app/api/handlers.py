@@ -5,13 +5,14 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from redis.asyncio import Redis
 
-from app.domain.models import NotificationRequest
+from app.domain.models import NotificationRequest, DeliveryReceipt
 from app.api.middleware import verify_idempotency_key
 from app.cache.redis_client import get_redis
 from app.repository.database import get_db_session
 from app.repository.notification import UserDndSetting
 from app.cache.bloom_filter import check_user_dnd_status
 from app.broker.router import NotificationRouter
+from app.worker.batcher import status_batcher
 
 logger = logging.getLogger(__name__)
 
@@ -83,4 +84,28 @@ async def ingest_notification(
         "status": "INGESTED",
         "message": "Notification successfully ingested and queued.",
         "notification_id": request.notification_id
+    }
+
+@router.post("/v1/webhook", status_code=status.HTTP_202_ACCEPTED)
+async def delivery_webhook(receipt: DeliveryReceipt):
+    """
+    Callback webhook receiving delivery status receipt events.
+    Appends the receipt immediately to the memory buffer of the StatusMicroBatcher
+    and returns HTTP 202 Accepted.
+    """
+    receipt_data = {
+        "notification_id": receipt.notification_id,
+        "status": receipt.status,
+        "sequence_id": receipt.sequence_id,
+        "timestamp": receipt.timestamp
+    }
+    
+    # Asynchronously append the receipt to the batcher buffer (non-blocking)
+    await status_batcher.add(receipt_data)
+    
+    logger.debug(f"Webhook enqueued status receipt event for notification {receipt.notification_id}.")
+    return {
+        "status": "ACCEPTED",
+        "message": "Receipt enqueued for processing.",
+        "notification_id": receipt.notification_id
     }
